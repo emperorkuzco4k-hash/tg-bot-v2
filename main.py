@@ -1,7 +1,8 @@
 import os
 import json
+import time
 import logging
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from telegram import (
     Update,
@@ -20,45 +21,53 @@ from telegram.ext import (
 )
 
 # =======================
-# تنظیمات
+# تنظیمات اصلی (فقط اینا رو عوض کن)
 # =======================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = 1016313273         # ✅ آیدی عددی خودت
+CHANNEL_ID = --1003740405524   # ✅ آیدی کانال پرایوت (با -100 شروع میشه)
 
-# 👇 فقط اینو عوض کن (آیدی تلگرام خودت)
-ADMIN_ID = 1016313273
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in Railway Variables (Environment).")
 
 DB_PATH = "db.json"
 
+# اگر خواستی پیام‌های ویدیو بعد از مدت حذف بشن:
+# 0 یعنی حذف نکن
+TTL_SECONDS = 0
+
+# دسته‌ها
 CATS_MAIN = ["فیلم", "سریال", "کارتون", "انیمیشن", "فیلم ایرانی", "سریال ایرانی"]
 ANIME_SUB = ["انیمیشن", "سریال انیمیشن"]
 
 SINGLE_CATS = {"فیلم", "کارتون", "انیمیشن", "فیلم ایرانی"}
 SERIES_CATS = {"سریال", "سریال ایرانی", "سریال انیمیشن"}
 
+# Browse modes
 MODE_NONE = "none"
 MODE_ANIME_MENU = "anime_menu"
 MODE_PICK_ITEM = "pick_item"
 MODE_PICK_SEASON = "pick_season"
 
 # =======================
-# لاگ
+# Logging
 # =======================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
-logger = logging.getLogger("bot")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables (Railway Variables).")
+log = logging.getLogger("bot")
 
 # =======================
 # DB
 # =======================
 def load_db() -> Dict[str, Any]:
     if not os.path.exists(DB_PATH):
-        return {"categories": {}, "_stats": {"requests": {}}}
-
+        return {
+            "categories": {},
+            "_stats": {"item_requests": {}, "season_requests": {}},
+            "_uploads": []  # فایل‌های اخیر کانال (برای /add)
+        }
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
             db = json.load(f)
@@ -67,32 +76,28 @@ def load_db() -> Dict[str, Any]:
 
     if "categories" not in db or not isinstance(db.get("categories"), dict):
         db["categories"] = {}
-
     db.setdefault("_stats", {})
-    db["_stats"].setdefault("requests", {})
+    db["_stats"].setdefault("item_requests", {})
+    db["_stats"].setdefault("season_requests", {})
+    db.setdefault("_uploads", [])
 
-    # ensure categories exist
+    # دسته‌ها را بساز
     for c in (CATS_MAIN + ["سریال انیمیشن"]):
         db["categories"].setdefault(c, {})
 
-    return db
+    # محدود کردن لیست آپلودها
+    if isinstance(db.get("_uploads"), list) and len(db["_uploads"]) > 200:
+        db["_uploads"] = db["_uploads"][-200:]
 
+    return db
 
 def save_db(db: Dict[str, Any]) -> None:
     with open(DB_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
-
 def ensure_db() -> None:
     db = load_db()
     save_db(db)
-
-
-def bump_stat(key: str) -> None:
-    db = load_db()
-    db["_stats"]["requests"][key] = int(db["_stats"]["requests"].get(key, 0)) + 1
-    save_db(db)
-
 
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
@@ -111,7 +116,6 @@ def kb_main():
         is_persistent=True,
     )
 
-
 def kb_anime_menu():
     return ReplyKeyboardMarkup(
         [
@@ -122,12 +126,10 @@ def kb_anime_menu():
         one_time_keyboard=True,
     )
 
-
 def kb_list(items: List[str]):
-    rows = [[x] for x in items[:40]]
+    rows = [[x] for x in items[:30]]
     rows.append(["⬅️ برگشت"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
-
 
 def kb_seasons(seasons: List[int]):
     rows = []
@@ -142,7 +144,44 @@ def kb_seasons(seasons: List[int]):
     rows.append(["⬅️ برگشت"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
+def kb_add_cats():
+    return ReplyKeyboardMarkup(
+        [
+            ["فیلم", "سریال"],
+            ["کارتون", "انیمیشن"],
+            ["سریال انیمیشن"],
+            ["فیلم ایرانی", "سریال ایرانی"],
+            ["⬅️ برگشت"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
+def kb_yes_no_last():
+    return ReplyKeyboardMarkup(
+        [["✅ ثبت آخرین فایل کانال"], ["❌ کنسل"]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+# =======================
+# Stats
+# =======================
+def bump_item_stat(cat: str, name: str):
+    db = load_db()
+    key = f"{cat}|{name}"
+    db["_stats"]["item_requests"][key] = int(db["_stats"]["item_requests"].get(key, 0)) + 1
+    save_db(db)
+
+def bump_season_stat(cat: str, name: str, season: int):
+    db = load_db()
+    key = f"{cat}|{name}|{season}"
+    db["_stats"]["season_requests"][key] = int(db["_stats"]["season_requests"].get(key, 0)) + 1
+    save_db(db)
+
+# =======================
+# Search
+# =======================
 def search_items(q: str) -> List[Tuple[str, str]]:
     db = load_db()
     ql = q.lower().strip()
@@ -153,31 +192,14 @@ def search_items(q: str) -> List[Tuple[str, str]]:
                 out.append((cat, name))
     return out[:10]
 
-
 def search_kb(results: List[Tuple[str, str]]):
     return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"{name} | {cat}", callback_data=f"search|{cat}|{name}")]
-            for cat, name in results
-        ]
+        [[InlineKeyboardButton(f"{name} | {cat}", callback_data=f"search|{cat}|{name}")]
+         for cat, name in results]
     )
 
-
-def ep_nav_kb(cat: str, name: str, season: int, ep: int, eps: List[int]):
-    row = []
-    if ep > eps[0]:
-        row.append(InlineKeyboardButton("⬅ قسمت قبلی", callback_data=f"ep|{cat}|{name}|{season}|{ep-1}"))
-    if ep < eps[-1]:
-        row.append(InlineKeyboardButton("➡ قسمت بعدی", callback_data=f"ep|{cat}|{name}|{season}|{ep+1}"))
-
-    buttons = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("📺 انتخاب فصل", callback_data=f"pickseason|{cat}|{name}")])
-    return InlineKeyboardMarkup(buttons)
-
 # =======================
-# Send media helpers
+# ارسال محتوا
 # =======================
 async def send_single(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: str, name: str):
     db = load_db()
@@ -186,22 +208,17 @@ async def send_single(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: str
         await context.bot.send_message(chat_id, "❌ مورد پیدا نشد.")
         return
 
-    bump_stat(f"{cat}|{name}")
+    bump_item_stat(cat, name)
+
     file_id = item["file_id"]
     media = item.get("media", "video")
-    title = item.get("title") or ""
-
-    caption = f"🎬 {cat}\n📌 {name}"
-    if title:
-        caption += f"\n📝 {title}"
+    title = item.get("title") or name
+    caption = f"🎬 {cat}\n📌 {name}\n📝 {title}"
 
     if media == "photo":
         await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
-    elif media == "document":
-        await context.bot.send_document(chat_id, document=file_id, caption=caption)
     else:
         await context.bot.send_video(chat_id, video=file_id, caption=caption)
-
 
 async def send_episode(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: str, name: str, season: int, ep: int):
     db = load_db()
@@ -215,31 +232,72 @@ async def send_episode(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: st
         await context.bot.send_message(chat_id, "❌ این قسمت موجود نیست.")
         return
 
-    eps = sorted([int(k) for k in season_data.keys() if k.isdigit()])
-    if not eps:
-        await context.bot.send_message(chat_id, "❌ برای این فصل قسمتی ثبت نشده.")
-        return
-
-    bump_stat(f"{cat}|{name}|S{season}|E{ep}")
+    bump_item_stat(cat, name)
+    bump_season_stat(cat, name, season)
 
     ep_data = season_data[str(ep)]
     file_id = ep_data["file_id"]
-    media = ep_data.get("media", "video")
     title = ep_data.get("title") or f"S{season:02d}E{ep:02d}"
+    media = ep_data.get("media", "video")
 
     caption = f"🎬 {cat}\n{name}\nفصل {season} - قسمت {ep}\n{title}"
 
-    kb = ep_nav_kb(cat, name, season, ep, eps)
-
     if media == "photo":
-        await context.bot.send_photo(chat_id, photo=file_id, caption=caption, reply_markup=kb)
-    elif media == "document":
-        await context.bot.send_document(chat_id, document=file_id, caption=caption, reply_markup=kb)
+        await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
     else:
-        await context.bot.send_video(chat_id, video=file_id, caption=caption, reply_markup=kb)
+        await context.bot.send_video(chat_id, video=file_id, caption=caption)
 
 # =======================
-# /start + /ping + /myid
+# کانال: دریافت file_id از پست‌های کانال
+# =======================
+def extract_file_from_message(msg) -> Tuple[Optional[str], Optional[str]]:
+    # kind, file_id
+    if msg.video:
+        return "video", msg.video.file_id
+    if msg.document:
+        return "document", msg.document.file_id
+    if msg.photo:
+        return "photo", msg.photo[-1].file_id
+    if msg.audio:
+        return "audio", msg.audio.file_id
+    return None, None
+
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if not msg:
+        return
+
+    # فقط کانال خودمون
+    if msg.chat_id != CHANNEL_ID:
+        return
+
+    kind, file_id = extract_file_from_message(msg)
+    if not file_id:
+        return
+
+    db = load_db()
+    db["_uploads"].append({
+        "ts": int(time.time()),
+        "chat_id": msg.chat_id,
+        "message_id": msg.message_id,
+        "kind": kind,
+        "file_id": file_id,
+        "caption": (msg.caption or "")[:200],
+    })
+    save_db(db)
+
+    # برای /add راحت‌تر: آخرین فایل رو تو bot_data نگه دار
+    context.bot_data["last_channel_file"] = {
+        "kind": kind,
+        "file_id": file_id,
+        "message_id": msg.message_id,
+        "ts": int(time.time()),
+    }
+
+    log.info(f"[CHANNEL] saved kind={kind} file_id={file_id} message_id={msg.message_id}")
+
+# =======================
+# /start و منو
 # =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_db()
@@ -248,17 +306,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("picked_item", None)
     await update.message.reply_text("سلام 👋\nاز منوی زیر انتخاب کن:", reply_markup=kb_main())
 
-
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong 🟢")
 
+async def last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.bot_data.get("last_channel_file")
+    if not data:
+        await update.message.reply_text("هنوز چیزی از کانال ثبت نشده. یه فایل داخل کانال بفرست.")
+        return
+    await update.message.reply_text(
+        f"آخرین فایل کانال ثبت شده ✅\n"
+        f"نوع: {data.get('kind')}\n"
+        f"message_id: {data.get('message_id')}\n"
+        f"ts: {data.get('ts')}\n"
+        f"file_id:\n{data.get('file_id')}"
+    )
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else None
-    await update.message.reply_text(f"Your ID: {uid}")
+async def setlast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /setlast <file_id>
+    if not is_admin(update):
+        await update.message.reply_text("این بخش فقط برای ادمین است.")
+        return
+    parts = (update.message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("فرمت درست:\n/setlast <file_id>")
+        return
+    file_id = parts[1].strip()
+    context.bot_data["last_channel_file"] = {
+        "kind": "video",
+        "file_id": file_id,
+        "message_id": None,
+        "ts": int(time.time()),
+    }
+    await update.message.reply_text("✅ آخرین فایل (last) ست شد.")
 
 # =======================
-# Browse text handler
+# متن‌ها (Browse)
 # =======================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_db()
@@ -272,7 +355,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("منوی اصلی 👇", reply_markup=kb_main())
         return
 
-    # open anime menu
+    # anime menu open
     if text == "انیمیشن":
         context.user_data["mode"] = MODE_ANIME_MENU
         await update.message.reply_text("🎞 یکی رو انتخاب کن:", reply_markup=kb_anime_menu())
@@ -287,13 +370,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("فعلاً چیزی اضافه نشده.", reply_markup=kb_main())
             context.user_data["mode"] = MODE_NONE
             return
-
         context.user_data["mode"] = MODE_PICK_ITEM
         context.user_data["picked_cat"] = cat
         await update.message.reply_text(f"📌 {cat} رو انتخاب کن:", reply_markup=kb_list(items))
         return
 
-    # pick a main category (except anime which already handled)
+    # pick main category (except "انیمیشن" already handled)
     if text in CATS_MAIN and text != "انیمیشن":
         cat = text
         db = load_db()
@@ -302,13 +384,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("فعلاً چیزی اضافه نشده.", reply_markup=kb_main())
             context.user_data["mode"] = MODE_NONE
             return
-
         context.user_data["mode"] = MODE_PICK_ITEM
         context.user_data["picked_cat"] = cat
         await update.message.reply_text(f"📌 {cat} رو انتخاب کن:", reply_markup=kb_list(items))
         return
 
-    # smart search (if typed)
+    # smart search (free text)
     if len(text) >= 3 and text not in CATS_MAIN and text not in ANIME_SUB:
         results = search_items(text)
         if results:
@@ -335,7 +416,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_single(update.message.chat_id, context, cat, text)
             return
 
-        # series -> seasons list
+        # series -> pick season
         if cat in SERIES_CATS:
             entry = db["categories"][cat][text]
             seasons = sorted([int(k) for k in entry.get("seasons", {}).keys() if k.isdigit()])
@@ -343,21 +424,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["mode"] = MODE_NONE
                 await update.message.reply_text("برای این سریال فصلی ثبت نشده.", reply_markup=kb_main())
                 return
-
             context.user_data["mode"] = MODE_PICK_SEASON
             context.user_data["picked_item"] = text
             await update.message.reply_text("فصل رو انتخاب کن:", reply_markup=kb_seasons(seasons))
             return
 
-        context.user_data["mode"] = MODE_NONE
-        await update.message.reply_text("این بخش تنظیم نشده.", reply_markup=kb_main())
-        return
-
     # pick season
     if context.user_data.get("mode") == MODE_PICK_SEASON:
         cat = context.user_data.get("picked_cat")
         name = context.user_data.get("picked_item")
-
         if not cat or not name:
             context.user_data["mode"] = MODE_NONE
             await update.message.reply_text("از منو شروع کن.", reply_markup=kb_main())
@@ -367,21 +442,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 season = int(text.replace("فصل", "").strip())
             except ValueError:
-                context.user_data["mode"] = MODE_NONE
                 await update.message.reply_text("فصل نامعتبر.", reply_markup=kb_main())
+                context.user_data["mode"] = MODE_NONE
                 return
 
-            # send episode 1 by default
+            # فعلاً قسمت 1 رو می‌فرستیم
+            await send_episode(update.message.chat_id, context, cat, name, season, 1)
+
             context.user_data["mode"] = MODE_NONE
             context.user_data.pop("picked_cat", None)
             context.user_data.pop("picked_item", None)
-            await send_episode(update.message.chat_id, context, cat, name, season, 1)
             return
 
         await update.message.reply_text("از دکمه‌های فصل انتخاب کن.", reply_markup=kb_main())
         return
 
-    # default
     await update.message.reply_text("از منو یکی رو انتخاب کن 👇", reply_markup=kb_main())
 
 # =======================
@@ -392,16 +467,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    parts = (q.data or "").split("|")
-    if not parts:
+    data = (q.data or "").split("|")
+    if not data:
         return
 
-    if parts[0] == "search" and len(parts) >= 3:
-        cat = parts[1]
-        name = "|".join(parts[2:])  # just in case
+    if data[0] == "search" and len(data) >= 3:
+        cat = data[1]
+        name = "|".join(data[2:])  # safe
         if cat in SINGLE_CATS:
             await send_single(q.message.chat_id, context, cat, name)
-        elif cat in SERIES_CATS:
+            return
+        if cat in SERIES_CATS:
             db = load_db()
             entry = db["categories"].get(cat, {}).get(name)
             if not entry:
@@ -414,63 +490,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["mode"] = MODE_PICK_SEASON
             context.user_data["picked_cat"] = cat
             context.user_data["picked_item"] = name
-            await context.bot.send_message(
-                q.message.chat_id, f"📺 {name}\nفصل را انتخاب کن:", reply_markup=kb_seasons(seasons)
-            )
-        return
-
-    if parts[0] == "ep" and len(parts) >= 5:
-        cat = parts[1]
-        name = parts[2]
-        season = int(parts[3])
-        ep = int(parts[4])
-        await send_episode(q.message.chat_id, context, cat, name, season, ep)
-        return
-
-    if parts[0] == "pickseason" and len(parts) >= 3:
-        cat = parts[1]
-        name = parts[2]
-        db = load_db()
-        entry = db["categories"].get(cat, {}).get(name)
-        if not entry:
-            await context.bot.send_message(q.message.chat_id, "❌ پیدا نشد.")
+            await context.bot.send_message(q.message.chat_id, f"📺 {name}\nفصل را انتخاب کن:", reply_markup=kb_seasons(seasons))
             return
-        seasons = sorted([int(k) for k in entry.get("seasons", {}).keys() if k.isdigit()])
-        context.user_data["mode"] = MODE_PICK_SEASON
-        context.user_data["picked_cat"] = cat
-        context.user_data["picked_item"] = name
-        await context.bot.send_message(
-            q.message.chat_id, f"📺 {name}\nفصل را انتخاب کن:", reply_markup=kb_seasons(seasons)
-        )
-        return
 
 # =======================
-# Admin /add conversation
-# آپلود = کاربر (ادمین) فایل رو می‌فرسته و ما file_id رو ذخیره می‌کنیم
+# /add (admin) - فقط ثبت اطلاعات (فعلاً فایل از کانال می‌گیریم)
 # =======================
-ASK_CAT, ASK_NAME, ASK_SEASON, ASK_EP, ASK_TITLE, ASK_FILE = range(6)
-
-def kb_add_cat():
-    return ReplyKeyboardMarkup(
-        [
-            ["فیلم", "سریال"],
-            ["کارتون", "انیمیشن"],
-            ["سریال انیمیشن"],
-            ["فیلم ایرانی", "سریال ایرانی"],
-            ["⬅️ برگشت"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+ASK_CAT, ASK_NAME, ASK_TYPE, ASK_SEASON, ASK_EP, ASK_TITLE, ASK_USE_LAST = range(7)
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_db()
     if not is_admin(update):
         await update.message.reply_text("این بخش فقط برای ادمین است.")
         return ConversationHandler.END
-
     context.user_data["add"] = {}
-    await update.message.reply_text("کدوم دسته؟", reply_markup=kb_add_cat())
+    await update.message.reply_text("کدوم دسته؟", reply_markup=kb_add_cats())
     return ASK_CAT
 
 async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,7 +514,7 @@ async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if cat not in (CATS_MAIN + ["سریال انیمیشن"]):
-        await update.message.reply_text("از دکمه‌ها انتخاب کن.", reply_markup=kb_add_cat())
+        await update.message.reply_text("از دکمه‌ها انتخاب کن.", reply_markup=kb_add_cats())
         return ASK_CAT
 
     context.user_data["add"]["cat"] = cat
@@ -490,28 +524,30 @@ async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = (update.message.text or "").strip()
     if not name:
-        await update.message.reply_text("اسم معتبر بده.")
+        await update.message.reply_text("اسم خالی نباشه.")
         return ASK_NAME
 
     cat = context.user_data["add"]["cat"]
     context.user_data["add"]["name"] = name
 
+    # تشخیص سریال یا تک
     if cat in SERIES_CATS:
+        context.user_data["add"]["type"] = "series"
         await update.message.reply_text("شماره فصل؟ (مثلاً 1)")
         return ASK_SEASON
     else:
-        # single
-        await update.message.reply_text("عنوان/توضیح کوتاه (اختیاری). اگر نداری یه نقطه بفرست.")
+        context.user_data["add"]["type"] = "single"
+        await update.message.reply_text("عنوان/توضیح (اختیاری). اگر نمیخوای، همین یه نقطه بفرست: .")
         return ASK_TITLE
 
 async def add_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
+    t = (update.message.text or "").strip()
     try:
-        season = int(txt)
+        season = int(t)
         if season < 1:
-            raise ValueError
+            raise ValueError()
     except ValueError:
-        await update.message.reply_text("شماره فصل باید عدد مثبت باشه. دوباره بفرست.")
+        await update.message.reply_text("فصل باید عدد مثبت باشه. دوباره بفرست.")
         return ASK_SEASON
 
     context.user_data["add"]["season"] = season
@@ -519,119 +555,119 @@ async def add_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_EP
 
 async def add_ep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
+    t = (update.message.text or "").strip()
     try:
-        ep = int(txt)
-        if ep < 1:
-            raise ValueError
+        ep = int(t)
+        if ep < 0:
+            raise ValueError()
     except ValueError:
-        await update.message.reply_text("شماره قسمت باید عدد مثبت باشه. دوباره بفرست.")
+        await update.message.reply_text("قسمت باید عدد باشه (0 هم می‌تونه پوستر فصل باشه). دوباره بفرست.")
         return ASK_EP
 
     context.user_data["add"]["ep"] = ep
-    await update.message.reply_text("عنوان/توضیح کوتاه (اختیاری). اگر نداری یه نقطه بفرست.")
+    await update.message.reply_text("عنوان/توضیح (اختیاری). اگر نمیخوای، همین یه نقطه بفرست: .")
     return ASK_TITLE
 
 async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = (update.message.text or "").strip()
     if title == ".":
         title = ""
+
     context.user_data["add"]["title"] = title
 
+    # حالا از آخرین فایل کانال استفاده کنیم
+    last_data = context.bot_data.get("last_channel_file")
+    if not last_data:
+        await update.message.reply_text(
+            "هنوز هیچ فایلی از کانال ثبت نشده.\n"
+            "اول داخل کانال یه ویدیو/فایل بفرست، بعد دوباره /add رو بزن."
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
-        "حالا فایل رو بفرست (ویدیو / داکیومنت / عکس).\n"
-        "✅ همینجا فایل رو Send کن."
+        "میخوای همین «آخرین فایل کانال» رو برای این آیتم ثبت کنم؟",
+        reply_markup=kb_yes_no_last()
     )
-    return ASK_FILE
+    return ASK_USE_LAST
 
-def extract_file_id_and_media(update: Update) -> Tuple[Optional[str], Optional[str]]:
-    m = update.message
-    if not m:
-        return None, None
+async def add_use_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t == "❌ کنسل":
+        await update.message.reply_text("کنسل شد.", reply_markup=kb_main())
+        return ConversationHandler.END
 
-    if m.video:
-        return m.video.file_id, "video"
-    if m.document:
-        return m.document.file_id, "document"
-    if m.photo and len(m.photo) > 0:
-        return m.photo[-1].file_id, "photo"
+    if t != "✅ ثبت آخرین فایل کانال":
+        await update.message.reply_text("از دکمه‌ها انتخاب کن.", reply_markup=kb_yes_no_last())
+        return ASK_USE_LAST
 
-    return None, None
+    last_data = context.bot_data.get("last_channel_file")
+    if not last_data:
+        await update.message.reply_text("آخرین فایل پیدا نشد. دوباره فایل داخل کانال بفرست.", reply_markup=kb_main())
+        return ConversationHandler.END
 
-async def add_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_id, media = extract_file_id_and_media(update)
-    if not file_id:
-        await update.message.reply_text("فایل معتبر نیست. لطفاً ویدیو/فایل/عکس بفرست.")
-        return ASK_FILE
-
-    data = context.user_data["add"]
-    cat = data["cat"]
-    name = data["name"]
-    title = data.get("title", "")
+    file_id = last_data.get("file_id")
+    kind = last_data.get("kind") or "video"
+    media = "video" if kind in ("video", "document") else "photo"
 
     db = load_db()
+    cat = context.user_data["add"]["cat"]
+    name = context.user_data["add"]["name"]
+    title = context.user_data["add"].get("title", "")
 
-    # series
-    if cat in SERIES_CATS:
-        season = int(data["season"])
-        ep = int(data["ep"])
-
-        db["categories"].setdefault(cat, {})
-        db["categories"][cat].setdefault(name, {"type": "series", "seasons": {}})
-
-        entry = db["categories"][cat][name]
-        entry["type"] = "series"
-        entry.setdefault("seasons", {})
-        entry["seasons"].setdefault(str(season), {})
-        entry["seasons"][str(season)][str(ep)] = {
-            "file_id": file_id,
-            "media": media,
-            "title": title,
-        }
-
-        save_db(db)
-        await update.message.reply_text(
-            f"✅ ذخیره شد:\n{cat} / {name}\nفصل {season} - قسمت {ep}",
-            reply_markup=kb_main(),
-        )
-    else:
-        # single
+    if context.user_data["add"]["type"] == "single":
         db["categories"].setdefault(cat, {})
         db["categories"][cat][name] = {
             "type": "single",
-            "file_id": file_id,
             "media": media,
+            "file_id": file_id,
             "title": title,
+            "source": "channel",
         }
-
         save_db(db)
-        await update.message.reply_text(
-            f"✅ ذخیره شد:\n{cat} / {name}",
-            reply_markup=kb_main(),
-        )
+        await update.message.reply_text(f"✅ ثبت شد: {cat} / {name}", reply_markup=kb_main())
+        return ConversationHandler.END
 
-    context.user_data.pop("add", None)
+    # series
+    season = int(context.user_data["add"]["season"])
+    ep = int(context.user_data["add"]["ep"])
+    db["categories"].setdefault(cat, {})
+    if name not in db["categories"][cat]:
+        db["categories"][cat][name] = {"type": "series", "seasons": {}}
+
+    db["categories"][cat][name].setdefault("seasons", {})
+    db["categories"][cat][name]["seasons"].setdefault(str(season), {})
+    db["categories"][cat][name]["seasons"][str(season)][str(ep)] = {
+        "media": media,
+        "file_id": file_id,
+        "title": title,
+        "source": "channel",
+    }
+    save_db(db)
+
+    await update.message.reply_text(f"✅ ثبت شد: {cat} / {name} / فصل {season} / قسمت {ep}", reply_markup=kb_main())
     return ConversationHandler.END
 
-async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("add", None)
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("کنسل شد.", reply_markup=kb_main())
     return ConversationHandler.END
 
 # =======================
-# Main
+# main
 # =======================
 def main():
     ensure_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("last", last))
+    app.add_handler(CommandHandler("setlast", setlast))
 
-    # /add conversation
+    # Channel posts (برای گرفتن file_id)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
+
+    # /add admin
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", add_start)],
         states={
@@ -640,20 +676,18 @@ def main():
             ASK_SEASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_season)],
             ASK_EP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ep)],
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
-            ASK_FILE: [MessageHandler(~filters.COMMAND, add_file)],
+            ASK_USE_LAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_use_last)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_add)],
+        fallbacks=[CommandHandler("cancel", add_cancel)],
         allow_reentry=True,
     )
     app.add_handler(add_conv)
 
-    # callbacks
+    # Callbacks + Text
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    # text browsing
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    logger.info("Bot is running...")
+    log.info("Bot is running...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
