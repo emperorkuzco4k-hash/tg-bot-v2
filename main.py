@@ -7,16 +7,12 @@ import logging
 from telegram import *
 from telegram.ext import *
 
-# ================= CONFIG =================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
 ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID","0"))
 
 DB_PATH="db.json"
 DELETE_TIME=30
-
-# ================= LOG =================
 
 logging.basicConfig(level=logging.INFO)
 log=logging.getLogger("bot")
@@ -56,9 +52,7 @@ def kb_main():
 # ================= AUTO DELETE =================
 
 async def auto_delete(context,chat_id,msg_id):
-
     await asyncio.sleep(DELETE_TIME)
-
     try:
         await context.bot.delete_message(chat_id,msg_id)
     except:
@@ -125,52 +119,6 @@ async def on_channel_post(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
     save_db(db)
 
-# ================= SEND EPISODE =================
-
-async def send_episode(chat_id,context,cat,name,season,ep,dub="sub"):
-
-    db=load_db()
-
-    entry=db["categories"].get(cat,{}).get(name)
-
-    if not entry:
-        return
-
-    ep_data=entry["seasons"].get(str(season),{}).get(str(ep),{})
-
-    file_id=ep_data.get(dub) or ep_data.get("sub") or ep_data.get("dub")
-
-    if not file_id:
-        return
-
-    msg=await context.bot.send_video(
-        chat_id,
-        file_id,
-        caption=f"{name}\nفصل {season} | قسمت {ep}"
-    )
-
-    asyncio.create_task(auto_delete(context,chat_id,msg.message_id))
-
-# ================= TEXT HANDLER =================
-
-async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
-
-    text=update.message.text
-    db=load_db()
-
-    if text=="🔎 جستجو":
-        await update.message.reply_text("نام فیلم یا سریال را بنویس")
-        return
-
-    if text in db["categories"]:
-
-        rows=[[i] for i in db["categories"][text]]
-
-        await update.message.reply_text(
-            "📺 انتخاب کن",
-            reply_markup=ReplyKeyboardMarkup(rows,resize_keyboard=True)
-        )
-
 # ================= START =================
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -179,6 +127,53 @@ async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "👋 خوش آمدی",
         reply_markup=kb_main()
     )
+
+# ================= TEXT MENU FIX ⭐⭐⭐ =================
+
+async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    text = update.message.text
+    db = load_db()
+
+    # منوی اصلی
+    if text in ["فیلم","سریال","کارتون","انیمیشن","فیلم ایرانی","سریال ایرانی"]:
+
+        cat=text
+
+        items=list(db["categories"].get(cat,{}).keys())
+
+        if not items:
+            await update.message.reply_text("فعلاً چیزی اضافه نشده")
+            return
+
+        rows=[[i] for i in items]
+
+        await update.message.reply_text(
+            f"📺 {cat}",
+            reply_markup=ReplyKeyboardMarkup(rows,resize_keyboard=True)
+        )
+        return
+
+    # انتخاب محتوا
+    for cat in db["categories"]:
+
+        if text in db["categories"][cat]:
+
+            entry=db["categories"][cat][text]
+
+            if entry["type"]=="single":
+
+                msg=await context.bot.send_video(
+                    update.message.chat_id,
+                    entry["file_id"],
+                    caption=text
+                )
+
+                asyncio.create_task(
+                    auto_delete(context,update.message.chat_id,msg.message_id)
+                )
+
+            return
 
 # ================= ADD =================
 
@@ -195,6 +190,9 @@ async def add(update:Update, context:ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 
 def main():
+
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
 
     app=Application.builder().token(BOT_TOKEN).build()
 
