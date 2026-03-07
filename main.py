@@ -7,20 +7,24 @@ import logging
 from telegram import *
 from telegram.ext import *
 
+# ================= CONFIG =================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
 ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID","0"))
 
 DB_PATH="db.json"
+DELETE_TIME=30
+
+# ================= LOG =================
 
 logging.basicConfig(level=logging.INFO)
 log=logging.getLogger("bot")
 
-DELETE_TIME=30
-
-# ========= DATABASE =========
+# ================= DATABASE =================
 
 def load_db():
+
     if not os.path.exists(DB_PATH):
         return {"categories":{}}
 
@@ -31,12 +35,14 @@ def load_db():
         return {"categories":{}}
 
 def save_db(db):
+
     with open(DB_PATH,"w",encoding="utf-8") as f:
         json.dump(db,f,ensure_ascii=False,indent=2)
 
-# ========= KEYBOARD =========
+# ================= KEYBOARD =================
 
 def kb_main():
+
     return ReplyKeyboardMarkup(
         [
             ["فیلم","سریال"],
@@ -47,16 +53,18 @@ def kb_main():
         resize_keyboard=True
     )
 
-# ========= AUTO DELETE =========
+# ================= AUTO DELETE =================
 
 async def auto_delete(context,chat_id,msg_id):
+
     await asyncio.sleep(DELETE_TIME)
+
     try:
         await context.bot.delete_message(chat_id,msg_id)
     except:
         pass
 
-# ========= PARSER =========
+# ================= PARSER =================
 
 def parse_caption(text):
 
@@ -65,13 +73,10 @@ def parse_caption(text):
     name=None
     season=None
     ep=None
-
     dub="sub"
 
     if "دوبله" in text:
         dub="dub"
-    if "زیرنویس" in text:
-        dub="sub"
 
     for t in tags:
 
@@ -88,7 +93,7 @@ def parse_caption(text):
 
     return "سریال",name,season,ep,dub
 
-# ========= CHANNEL SYNC =========
+# ================= CHANNEL SYNC =================
 
 async def on_channel_post(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
@@ -120,7 +125,7 @@ async def on_channel_post(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
     save_db(db)
 
-# ========= SEND EPISODE =========
+# ================= SEND EPISODE =================
 
 async def send_episode(chat_id,context,cat,name,season,ep,dub="sub"):
 
@@ -131,10 +136,9 @@ async def send_episode(chat_id,context,cat,name,season,ep,dub="sub"):
     if not entry:
         return
 
-    season_data=entry["seasons"].get(str(season),{})
-    ep_data=season_data.get(str(ep),{})
+    ep_data=entry["seasons"].get(str(season),{}).get(str(ep),{})
 
-    file_id=ep_data.get(dub) or ep_data.get("dub") or ep_data.get("sub")
+    file_id=ep_data.get(dub) or ep_data.get("sub") or ep_data.get("dub")
 
     if not file_id:
         return
@@ -142,12 +146,32 @@ async def send_episode(chat_id,context,cat,name,season,ep,dub="sub"):
     msg=await context.bot.send_video(
         chat_id,
         file_id,
-        caption=f"{name} | فصل {season} | قسمت {ep}"
+        caption=f"{name}\nفصل {season} | قسمت {ep}"
     )
 
     asyncio.create_task(auto_delete(context,chat_id,msg.message_id))
 
-# ========= START =========
+# ================= TEXT HANDLER =================
+
+async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    text=update.message.text
+    db=load_db()
+
+    if text=="🔎 جستجو":
+        await update.message.reply_text("نام فیلم یا سریال را بنویس")
+        return
+
+    if text in db["categories"]:
+
+        rows=[[i] for i in db["categories"][text]]
+
+        await update.message.reply_text(
+            "📺 انتخاب کن",
+            reply_markup=ReplyKeyboardMarkup(rows,resize_keyboard=True)
+        )
+
+# ================= START =================
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
@@ -156,24 +180,7 @@ async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_main()
     )
 
-# ========= SEARCH =========
-
-async def search(update:Update, context:ContextTypes.DEFAULT_TYPE):
-
-    text=" ".join(context.args)
-
-    db=load_db()
-
-    result=[]
-
-    for cat in db["categories"]:
-        for name in db["categories"][cat]:
-            if text.lower() in name.lower():
-                result.append(name)
-
-    await update.message.reply_text("\n".join(result[:20]) or "چیزی پیدا نشد")
-
-# ========= ADD COMMAND =========
+# ================= ADD =================
 
 async def add(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
@@ -185,22 +192,20 @@ async def add(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "#سریال #نام #S01E01 #دوبله یا #زیرنویس"
     )
 
-# ========= MAIN =========
+# ================= MAIN =================
 
 def main():
-
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
 
     app=Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("add",add))
-    app.add_handler(CommandHandler("search",search))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,on_text))
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST,on_channel_post))
 
-    log.info("Bot Running")
+    log.info("BOT RUNNING")
 
     app.run_polling(drop_pending_updates=True)
 
