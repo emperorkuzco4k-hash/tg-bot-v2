@@ -526,6 +526,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("last", last))
+    app.add_handler(CommandHandler("add", add))
 
     # کانال
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
