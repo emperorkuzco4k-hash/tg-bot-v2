@@ -1,423 +1,208 @@
 import os
 import json
-import time
 import re
+import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import *
+from telegram.ext import *
 
-# =======================
-# ENV
-# =======================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int((os.getenv("ADMIN_ID", "0").strip() or "0"))
-ARCHIVE_CHANNEL_ID = int((os.getenv("ARCHIVE_CHANNEL_ID", "0").strip() or "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
+ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID","0"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set.")
-if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID is not set.")
-if not ARCHIVE_CHANNEL_ID:
-    raise RuntimeError("ARCHIVE_CHANNEL_ID is not set (e.g. -100...).")
+DB_PATH="db.json"
 
-DB_PATH = "db.json"
+logging.basicConfig(level=logging.INFO)
+log=logging.getLogger("bot")
 
-# دسته‌ها
-CATS_MAIN = ["فیلم", "سریال", "کارتون", "انیمیشن", "فیلم ایرانی", "سریال ایرانی"]
-ANIME_SUB = ["انیمیشن", "سریال انیمیشن"]
+DELETE_TIME=30
 
-SINGLE_CATS = {"فیلم", "کارتون", "انیمیشن", "فیلم ایرانی"}
-SERIES_CATS = {"سریال", "سریال ایرانی", "سریال انیمیشن"}
+# ========= DATABASE =========
 
-# حالت‌ها
-MODE_NONE = "none"
-MODE_ANIME_MENU = "anime_menu"
-MODE_PICK_ITEM = "pick_item"
-MODE_PICK_SEASON = "pick_season"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("filmbaz")
-
-# =======================
-# DB
-# =======================
-def load_db() -> Dict[str, Any]:
+def load_db():
     if not os.path.exists(DB_PATH):
-        return {"categories": {}, "_uploads": []}
+        return {"categories":{}}
+
     try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            db = json.load(f)
-    except Exception:
-        db = {}
-    db.setdefault("categories", {})
-    db.setdefault("_uploads", [])
-    for c in (CATS_MAIN + ["سریال انیمیشن"]):
-        db["categories"].setdefault(c, {})
-    if len(db["_uploads"]) > 200:
-        db["_uploads"] = db["_uploads"][-200:]
-    return db
+        with open(DB_PATH,"r",encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"categories":{}}
 
-def save_db(db: Dict[str, Any]) -> None:
-    with open(DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+def save_db(db):
+    with open(DB_PATH,"w",encoding="utf-8") as f:
+        json.dump(db,f,ensure_ascii=False,indent=2)
 
-def ensure_db():
-    save_db(load_db())
+# ========= KEYBOARD =========
 
-# =======================
-# Keyboards
-# =======================
 def kb_main():
     return ReplyKeyboardMarkup(
         [
-            ["فیلم", "سریال"],
-            ["کارتون", "انیمیشن"],
-            ["فیلم ایرانی", "سریال ایرانی"],
+            ["فیلم","سریال"],
+            ["کارتون","انیمیشن"],
+            ["فیلم ایرانی","سریال ایرانی"],
+            ["🔎 جستجو"]
         ],
-        resize_keyboard=True,
-        is_persistent=True,
+        resize_keyboard=True
     )
 
-def kb_anime_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["انیمیشن", "سریال انیمیشن"],
-            ["⬅️ برگشت"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+# ========= AUTO DELETE =========
 
-def kb_list(items: List[str]):
-    rows = [[x] for x in items[:30]]
-    rows.append(["⬅️ برگشت"])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+async def auto_delete(context,chat_id,msg_id):
+    await asyncio.sleep(DELETE_TIME)
+    try:
+        await context.bot.delete_message(chat_id,msg_id)
+    except:
+        pass
 
-def kb_seasons(seasons: List[int]):
-    rows, buf = [], []
-    for s in seasons:
-        buf.append(f"فصل {s}")
-        if len(buf) == 2:
-            rows.append(buf); buf = []
-    if buf:
-        rows.append(buf)
-    rows.append(["⬅️ برگشت"])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+# ========= PARSER =========
 
-def ep_nav_kb(cat: str, name: str, season: int, ep: int, eps: List[int]):
-    row = []
-    if ep > eps[0]:
-        row.append(InlineKeyboardButton("⬅ قسمت قبلی", callback_data=f"ep|{cat}|{name}|{season}|{ep-1}"))
-    if ep < eps[-1]:
-        row.append(InlineKeyboardButton("➡ قسمت بعدی", callback_data=f"ep|{cat}|{name}|{season}|{ep+1}"))
-    buttons = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("📺 انتخاب فصل", callback_data=f"pickseason|{cat}|{name}")])
-    return InlineKeyboardMarkup(buttons)
+def parse_caption(text):
 
-# =======================
-# Helpers: media extract
-# =======================
-def extract_media(msg) -> Tuple[Optional[str], Optional[str]]:
-    # media_type, file_id
-    if msg.video:
-        return "video", msg.video.file_id
-    if msg.document:
-        return "document", msg.document.file_id
-    if msg.photo:
-        return "photo", msg.photo[-1].file_id
-    if msg.audio:
-        return "audio", msg.audio.file_id
-    return None, None
+    tags=re.findall(r"#\S+",text or "")
 
-# =======================
-# Hashtag parser
-# =======================
-STRUCT_TAGS = {
-    "فیلم","سریال","کارتون","انیمیشن","ایرانی","فیلم_ایرانی","سریال_ایرانی",
-    "film","series","cartoon","anime","iran","iranian",
-}
+    name=None
+    season=None
+    ep=None
 
-def norm_tag(t: str) -> str:
-    t = t.strip()
-    if t.startswith("#"):
-        t = t[1:]
-    return t.strip()
+    dub="sub"
 
-def detect_category(tags: List[str]) -> str:
-    tl = [x.lower() for x in tags]
-    # فارسی
-    if "فیلم_ایرانی" in tags or ("فیلم" in tags and "ایرانی" in tags):
-        return "فیلم ایرانی"
-    if "سریال_ایرانی" in tags or ("سریال" in tags and "ایرانی" in tags):
-        return "سریال ایرانی"
-    if "سریال" in tags:
-        return "سریال"
-    if "فیلم" in tags:
-        return "فیلم"
-    if "کارتون" in tags:
-        return "کارتون"
-    if "انیمیشن" in tags and "سریال" in tags:
-        return "سریال انیمیشن"
-    if "سریال_انیمیشن" in tags or "سریالانیمیشن" in tl:
-        return "سریال انیمیشن"
-    if "انیمیشن" in tags:
-        return "انیمیشن"
-    # انگلیسی
-    if "iranian" in tl and "film" in tl:
-        return "فیلم ایرانی"
-    if "iranian" in tl and "series" in tl:
-        return "سریال ایرانی"
-    if "series" in tl:
-        return "سریال"
-    if "film" in tl:
-        return "فیلم"
-    if "cartoon" in tl:
-        return "کارتون"
-    if "anime" in tl and "series" in tl:
-        return "سریال انیمیشن"
-    if "anime" in tl:
-        return "انیمیشن"
-    # پیش‌فرض
-    return "سریال"
+    if "دوبله" in text:
+        dub="dub"
+    if "زیرنویس" in text:
+        dub="sub"
 
-def detect_season_episode(tags: List[str]) -> Tuple[Optional[int], Optional[int]]:
-    # S01E02
     for t in tags:
-        m = re.match(r"(?i)^s(\d{1,2})e(\d{1,3})$", t)
+
+        t=t.replace("#","")
+
+        m=re.match(r"s(\d+)e(\d+)",t,re.I)
+
         if m:
-            return int(m.group(1)), int(m.group(2))
-    # فصل1 / قسمت2
-    season = None
-    ep = None
-    for t in tags:
-        m1 = re.match(r"^فصل(\d{1,2})$", t)
-        if m1:
-            season = int(m1.group(1))
-        m2 = re.match(r"^قسمت(\d{1,3})$", t)
-        if m2:
-            ep = int(m2.group(1))
-    return season, ep
+            season=int(m.group(1))
+            ep=int(m.group(2))
 
-def detect_name(tags: List[str]) -> Optional[str]:
-    # اولین تگی که ساختاری نیست، اسم محسوب می‌کنیم
-    for t in tags:
-        tl = t.lower()
-        if tl in STRUCT_TAGS:
-            continue
-        if re.match(r"(?i)^s\d{1,2}e\d{1,3}$", t):
-            continue
-        if re.match(r"^فصل\d{1,2}$", t) or re.match(r"^قسمت\d{1,3}$", t):
-            continue
-        return t
-    return None
+        elif not name:
+            name=t
 
-def parse_caption(caption: str) -> Tuple[str, str, Optional[int], Optional[int]]:
-    # returns cat, name, season, ep
-    tags = [norm_tag(x) for x in re.findall(r"#\S+", caption or "")]
-    cat = detect_category(tags)
-    season, ep = detect_season_episode(tags)
-    name = detect_name(tags) or "بدون_نام"
-    # نام را تمیزتر کنیم (فقط جهت نمایش)
-    name = name.replace("#", "").strip()
-    return cat, name, season, ep
+    return "سریال",name,season,ep,dub
 
-# =======================
-# Send functions
-# =======================
-async def send_single(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: str, name: str):
-    db = load_db()
-    item = db["categories"].get(cat, {}).get(name)
-    if not item:
-        await context.bot.send_message(chat_id, "❌ مورد پیدا نشد.")
+# ========= CHANNEL SYNC =========
+
+async def on_channel_post(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    msg=update.channel_post
+
+    if msg.chat_id != ARCHIVE_CHANNEL_ID:
         return
 
-    media = item.get("media", "video")
-    file_id = item["file_id"]
-    caption = item.get("caption") or f"{cat} / {name}"
-
-    if media == "photo":
-        await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
-    elif media == "document":
-        await context.bot.send_document(chat_id, document=file_id, caption=caption)
-    else:
-        await context.bot.send_video(chat_id, video=file_id, caption=caption)
-
-async def send_episode(chat_id: int, context: ContextTypes.DEFAULT_TYPE, cat: str, name: str, season: int, ep: int):
-    db = load_db()
-    entry = db["categories"].get(cat, {}).get(name)
-    if not entry or entry.get("type") != "series":
-        await context.bot.send_message(chat_id, "❌ سریال پیدا نشد.")
+    if not msg.video:
         return
 
-    season_data = entry.get("seasons", {}).get(str(season))
-    if not season_data or str(ep) not in season_data:
-        await context.bot.send_message(chat_id, "❌ این قسمت موجود نیست.")
-        return
+    cat,name,season,ep,dub=parse_caption(msg.caption or "")
 
-    eps = sorted([int(k) for k in season_data.keys() if k.isdigit() and int(k) >= 1])
-    ep_data = season_data[str(ep)]
-    file_id = ep_data["file_id"]
-    media = ep_data.get("media", "video")
-    caption = ep_data.get("caption") or f"{name} | فصل {season} | قسمت {ep}"
+    db=load_db()
 
-    kb = ep_nav_kb(cat, name, season, ep, eps)
+    db["categories"].setdefault(cat,{})
 
-    if media == "photo":
-        await context.bot.send_photo(chat_id, photo=file_id, caption=caption, reply_markup=kb)
-    elif media == "document":
-        await context.bot.send_document(chat_id, document=file_id, caption=caption, reply_markup=kb)
-    else:
-        await context.bot.send_video(chat_id, video=file_id, caption=caption, reply_markup=kb)
+    db["categories"][cat].setdefault(name,{
+        "type":"series",
+        "seasons":{}
+    })
 
-# =======================
-# Channel listener: AUTO REGISTER
-# =======================
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post
-    if not msg or msg.chat_id != ARCHIVE_CHANNEL_ID:
-        return
+    if season and ep:
 
-    media_type, file_id = extract_media(msg)
-    if not file_id:
-        return  # فقط مدیاها
+        db["categories"][cat][name]["seasons"].setdefault(str(season),{})
+        db["categories"][cat][name]["seasons"][str(season)].setdefault(str(ep),{})
 
-    caption = msg.caption or ""
-    cat, name, season, ep = parse_caption(caption)
+        db["categories"][cat][name]["seasons"][str(season)][str(ep)][dub]=msg.video.file_id
 
-    db = load_db()
-
-    # ثبت در لاگ/آخرین
-    context.bot_data["last_channel_file"] = {
-        "media_type": media_type,
-        "file_id": file_id,
-        "caption": caption,
-        "cat": cat,
-        "name": name,
-        "season": season,
-        "ep": ep,
-        "message_id": msg.message_id,
-        "ts": int(time.time()),
-    }
-    db["_uploads"].append(context.bot_data["last_channel_file"])
     save_db(db)
 
-    # ثبت خودکار در دیتابیس اصلی
-    # اگر سریال و فصل/قسمت دارد => سریال
-    if season is not None and ep is not None:
-        # دسته باید سریالی باشد؛ اگر نیست، خودکار تبدیلش می‌کنیم
-        if cat not in SERIES_CATS:
-            cat = "سریال"
-        db["categories"].setdefault(cat, {})
-        if name not in db["categories"][cat]:
-            db["categories"][cat][name] = {"type": "series", "seasons": {}}
-        db["categories"][cat][name].setdefault("seasons", {})
-        db["categories"][cat][name]["seasons"].setdefault(str(season), {})
-        db["categories"][cat][name]["seasons"][str(season)][str(ep)] = {
-            "media": "video" if media_type in ("video",) else ("photo" if media_type == "photo" else "document"),
-            "file_id": file_id,
-            "caption": caption,
-            "source": "channel",
-            "channel_message_id": msg.message_id,
-        }
-        save_db(db)
-        log.info(f"AUTO-REG series: {cat}/{name} S{season}E{ep}")
-    else:
-        # تک‌فیلم/تک محتوا
-        if cat not in SINGLE_CATS:
-            pass
-        db["categories"].setdefault(cat, {})
-        db["categories"][cat][name] = {
-            "type": "single",
-            "media": "video" if media_type in ("video",) else ("photo" if media_type == "photo" else "document"),
-            "file_id": file_id,
-            "caption": caption,
-            "source": "channel",
-            "channel_message_id": msg.message_id,
-        }
-        save_db(db)
-        log.info(f"AUTO-REG single: {cat}/{name}")
+# ========= SEND EPISODE =========
 
-# =======================
-# Commands & UI
-# =======================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_db()
-    context.user_data["mode"] = MODE_NONE
-    context.user_data.pop("picked_cat", None)
-    context.user_data.pop("picked_item", None)
-    await update.message.reply_text("سلام 👋\nاز منوی زیر انتخاب کن:", reply_markup=kb_main())
+async def send_episode(chat_id,context,cat,name,season,ep,dub="sub"):
 
-async def last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.bot_data.get("last_channel_file")
-    if not data:
-        await update.message.reply_text("هنوز چیزی از کانال ثبت نشده. یه ویدیو با هشتگ داخل کانال بفرست.")
+    db=load_db()
+
+    entry=db["categories"].get(cat,{}).get(name)
+
+    if not entry:
         return
-    await update.message.reply_text(
-        "آخرین مورد ثبت شده از کانال ✅\n"
-        f"دسته: {data.get('cat')}\n"
-        f"نام: {data.get('name')}\n"
-        f"فصل: {data.get('season')}\n"
-        f"قسمت: {data.get('ep')}\n"
-        f"message_id: {data.get('message_id')}"
+
+    season_data=entry["seasons"].get(str(season),{})
+    ep_data=season_data.get(str(ep),{})
+
+    file_id=ep_data.get(dub) or ep_data.get("dub") or ep_data.get("sub")
+
+    if not file_id:
+        return
+
+    msg=await context.bot.send_video(
+        chat_id,
+        file_id,
+        caption=f"{name} | فصل {season} | قسمت {ep}"
     )
 
-# =======================
-# اینجا تابع ADD رو اضافه کردیم
-# =======================
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    asyncio.create_task(auto_delete(context,chat_id,msg.message_id))
+
+# ========= START =========
+
+async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "👋 خوش آمدی",
+        reply_markup=kb_main()
+    )
+
+# ========= SEARCH =========
+
+async def search(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    text=" ".join(context.args)
+
+    db=load_db()
+
+    result=[]
+
+    for cat in db["categories"]:
+        for name in db["categories"][cat]:
+            if text.lower() in name.lower():
+                result.append(name)
+
+    await update.message.reply_text("\n".join(result[:20]) or "چیزی پیدا نشد")
+
+# ========= ADD COMMAND =========
+
+async def add(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ فقط ادمین می‌تواند از این دستور استفاده کند.")
         return
 
     await update.message.reply_text(
-        "برای اضافه کردن محتوا، فایل را در کانال آرشیو بفرست و هشتگ بگذار.\n\n"
-        "مثال:\n"
-        "#سریال #BreakingBad #S01E01\n"
-        "یا\n"
-        "#سریال #BreakingBad #فصل1 #قسمت1\n"
-        "یا برای فیلم:\n"
-        "#فیلم #Oppenheimer"
+        "📤 فایل را در کانال آرشیو بفرست\n"
+        "#سریال #نام #S01E01 #دوبله یا #زیرنویس"
     )
 
-# ادامه کد on_text و on_callback بدون تغییر باقی مانده
-# لطفاً همان کدهای شما را اینجا نگه دارید
-# ... (بقیه کدها بدون تغییر)
+# ========= MAIN =========
 
-# =======================
-# main
-# =======================
 def main():
-    ensure_db()
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("last", last))
-    app.add_handler(CommandHandler("add", add))  # حالا این خط درست شده
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
 
-    # کانال
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
+    app=Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("add",add))
+    app.add_handler(CommandHandler("search",search))
 
-    log.info("Bot is running...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST,on_channel_post))
 
-if __name__ == "__main__":
+    log.info("Bot Running")
+
+    app.run_polling(drop_pending_updates=True)
+
+if __name__=="__main__":
     main()
