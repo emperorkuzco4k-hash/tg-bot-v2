@@ -44,7 +44,8 @@ def kb_main():
             ["فیلم","سریال"],
             ["کارتون","انیمیشن"],
             ["فیلم ایرانی","سریال ایرانی"],
-            ["🔎 جستجو"]
+            ["🔎 جستجو"],
+            ["/last"]
         ],
         resize_keyboard=True
     )
@@ -52,40 +53,78 @@ def kb_main():
 # ================= AUTO DELETE =================
 
 async def auto_delete(context,chat_id,msg_id):
+
     await asyncio.sleep(DELETE_TIME)
+
     try:
         await context.bot.delete_message(chat_id,msg_id)
     except:
         pass
 
-# ================= PARSER =================
+# ================= START =================
 
-def parse_caption(text):
+async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
-    tags=re.findall(r"#\S+",text or "")
+    await update.message.reply_text(
+        "👋 خوش آمدی",
+        reply_markup=kb_main()
+    )
 
-    name=None
-    season=None
-    ep=None
-    dub="sub"
+# ================= LAST COMMAND (FIXED ⭐) =================
 
-    if "دوبله" in text:
-        dub="dub"
+async def last(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
-    for t in tags:
+    async for msg in context.bot.get_chat_history(
+        chat_id=ARCHIVE_CHANNEL_ID,
+        limit=1
+    ):
 
-        t=t.replace("#","")
+        if msg.video:
 
-        m=re.match(r"s(\d+)e(\d+)",t,re.I)
+            await update.message.reply_video(
+                msg.video.file_id,
+                caption=msg.caption or "آخرین فایل کانال"
+            )
+            return
 
-        if m:
-            season=int(m.group(1))
-            ep=int(m.group(2))
+    await update.message.reply_text("❌ چیزی پیدا نشد")
 
-        elif not name:
-            name=t
+# ================= TEXT MENU =================
 
-    return "سریال",name,season,ep,dub
+async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+    text = update.message.text
+    db = load_db()
+
+    if text in ["فیلم","سریال","کارتون","انیمیشن","فیلم ایرانی","سریال ایرانی"]:
+
+        cat=text
+
+        results=set()
+
+        async for msg in context.bot.get_chat_history(
+            chat_id=ARCHIVE_CHANNEL_ID,
+            limit=200
+        ):
+
+            if msg.video and msg.caption and cat in msg.caption:
+
+                name=re.findall(r"#\S+",msg.caption)
+
+                if name:
+                    results.add(name[0].replace("#",""))
+
+        if not results:
+            await update.message.reply_text("فعلاً چیزی اضافه نشده")
+            return
+
+        rows=[[r] for r in list(results)]
+
+        await update.message.reply_text(
+            cat,
+            reply_markup=ReplyKeyboardMarkup(rows,resize_keyboard=True)
+        )
+        return
 
 # ================= CHANNEL SYNC =================
 
@@ -99,108 +138,38 @@ async def on_channel_post(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not msg.video:
         return
 
-    cat,name,season,ep,dub=parse_caption(msg.caption or "")
+    caption=msg.caption or ""
+
+    tags=re.findall(r"#\S+",caption)
+
+    name=None
+    cat="سریال"
+
+    for t in tags:
+        if not name:
+            name=t.replace("#","")
 
     db=load_db()
 
     db["categories"].setdefault(cat,{})
 
     db["categories"][cat].setdefault(name,{
-        "type":"series",
-        "seasons":{}
+        "type":"single",
+        "file_id":msg.video.file_id
     })
 
-    if season and ep:
-
-        db["categories"][cat][name]["seasons"].setdefault(str(season),{})
-        db["categories"][cat][name]["seasons"][str(season)].setdefault(str(ep),{})
-
-        db["categories"][cat][name]["seasons"][str(season)][str(ep)][dub]=msg.video.file_id
-
     save_db(db)
-
-# ================= START =================
-
-async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "👋 خوش آمدی",
-        reply_markup=kb_main()
-    )
-
-# ================= TEXT MENU FIX ⭐⭐⭐ =================
-
-async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
-
-    text = update.message.text
-    db = load_db()
-
-    # منوی اصلی
-    if text in ["فیلم","سریال","کارتون","انیمیشن","فیلم ایرانی","سریال ایرانی"]:
-
-        cat=text
-
-        items=list(db["categories"].get(cat,{}).keys())
-
-        if not items:
-            await update.message.reply_text("فعلاً چیزی اضافه نشده")
-            return
-
-        rows=[[i] for i in items]
-
-        await update.message.reply_text(
-            f"📺 {cat}",
-            reply_markup=ReplyKeyboardMarkup(rows,resize_keyboard=True)
-        )
-        return
-
-    # انتخاب محتوا
-    for cat in db["categories"]:
-
-        if text in db["categories"][cat]:
-
-            entry=db["categories"][cat][text]
-
-            if entry["type"]=="single":
-
-                msg=await context.bot.send_video(
-                    update.message.chat_id,
-                    entry["file_id"],
-                    caption=text
-                )
-
-                asyncio.create_task(
-                    auto_delete(context,update.message.chat_id,msg.message_id)
-                )
-
-            return
-
-# ================= ADD =================
-
-async def add(update:Update, context:ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    await update.message.reply_text(
-        "📤 فایل را در کانال آرشیو بفرست\n"
-        "#سریال #نام #S01E01 #دوبله یا #زیرنویس"
-    )
 
 # ================= MAIN =================
 
 def main():
 
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
-
     app=Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("add",add))
+    app.add_handler(CommandHandler("last",last))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,on_text))
-
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST,on_channel_post))
 
     log.info("BOT RUNNING")
