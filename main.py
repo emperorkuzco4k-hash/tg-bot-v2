@@ -28,8 +28,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))
 
-# اختیاری:
-# اگر بخوای عضویت اجباری فعال باشه، داخل Railway اینا رو ست کن
 REQUIRED_CHANNEL_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "0") or "0")
 REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "").strip()
 
@@ -50,13 +48,13 @@ CATEGORIES = [
     "انیمیشن",
     "فیلم ایرانی",
     "سریال ایرانی",
+    "کالکشن ها",
+    "بتمن ها",
 ]
 
 SEARCH_BTN = "🔎 جستجو"
 BACK_BTN = "⬅️ بازگشت"
 HOME_BTN = "🏠 خانه"
-
-# ================= STATES =================
 
 (
     ADD_KIND,
@@ -67,7 +65,6 @@ HOME_BTN = "🏠 خانه"
     ADD_SERIES_SEASON_COUNT,
     ADD_SERIES_EPISODE_COUNT,
     ADD_SERIES_EPISODE_FILE,
-
     EDIT_WAIT_TITLE,
     EDIT_WAIT_POSTER,
     EDIT_WAIT_MOVIE_FILE,
@@ -126,6 +123,7 @@ def kb_main():
             ["فیلم", "سریال"],
             ["کارتون", "انیمیشن"],
             ["فیلم ایرانی", "سریال ایرانی"],
+            ["کالکشن ها", "بتمن ها"],
             [SEARCH_BTN],
         ],
         resize_keyboard=True
@@ -207,11 +205,9 @@ def paginate_list(items, page, page_size=PAGE_SIZE):
     return items[start:end], page, pages
 
 def get_archive_message_id_from_message(message):
-    # اگر عدد ساده فرستاده شود
     if message.text and message.text.strip().isdigit():
         return int(message.text.strip())
 
-    # اگر پیام از کانال آرشیو فوروارد شده باشد
     try:
         if getattr(message, "forward_from_chat", None) and getattr(message, "forward_from_message_id", None):
             if message.forward_from_chat.id == ARCHIVE_CHANNEL_ID:
@@ -219,7 +215,6 @@ def get_archive_message_id_from_message(message):
     except Exception:
         pass
 
-    # ساختارهای جدید تلگرام
     try:
         origin = getattr(message, "forward_origin", None)
         if origin and hasattr(origin, "chat") and hasattr(origin, "message_id"):
@@ -229,12 +224,6 @@ def get_archive_message_id_from_message(message):
         pass
 
     return None
-
-async def delete_message_safe(bot, chat_id, message_id):
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
 
 async def auto_delete_file_and_keep_redownload(
     context: ContextTypes.DEFAULT_TYPE,
@@ -305,9 +294,6 @@ async def copy_archive_message_and_schedule_delete(
             episode_num=episode_num,
         )
     )
-
-async def send_home(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text="🏠 منوی اصلی"):
-    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb_main())
 
 # ================= RENDERING =================
 
@@ -1398,7 +1384,10 @@ def main():
         entry_points=[CommandHandler("edit", edit_command)],
         states={
             EDIT_WAIT_TITLE: [
-                CallbackQueryHandler(edit_callback_entry, pattern=r"^(admin_edit_page:|edit_item:|edit_field:title:|edit_field:poster:|edit_field:moviefile:|edit_field:seriesfile:|edit_series_season:)"),
+                CallbackQueryHandler(
+                    edit_callback_entry,
+                    pattern=r"^(admin_edit_page:|edit_item:|edit_field:title:|edit_field:poster:|edit_field:moviefile:|edit_field:seriesfile:|edit_series_season:)"
+                ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_title_wait),
             ],
             EDIT_WAIT_POSTER: [
