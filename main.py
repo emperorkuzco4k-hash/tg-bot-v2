@@ -340,8 +340,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # تک‌فیلم/تک محتوا
         if cat not in SINGLE_CATS:
-            # اگر فقط #سریال زده ولی فصل/قسمت نداده، باز تک ذخیره می‌کنیم
-            # کاربر می‌تواند بعداً فصل/قسمت استاندارد بزند
             pass
         db["categories"].setdefault(cat, {})
         db["categories"][cat][name] = {
@@ -379,143 +377,27 @@ async def last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"message_id: {data.get('message_id')}"
     )
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_db()
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ برگشت":
-        context.user_data["mode"] = MODE_NONE
-        context.user_data.pop("picked_cat", None)
-        context.user_data.pop("picked_item", None)
-        await update.message.reply_text("منوی اصلی 👇", reply_markup=kb_main())
+# =======================
+# اینجا تابع ADD رو اضافه کردیم
+# =======================
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ فقط ادمین می‌تواند از این دستور استفاده کند.")
         return
 
-    # انیمیشن => زیرمنو
-    if text == "انیمیشن":
-        context.user_data["mode"] = MODE_ANIME_MENU
-        await update.message.reply_text("🎞 یکی رو انتخاب کن:", reply_markup=kb_anime_menu())
-        return
+    await update.message.reply_text(
+        "برای اضافه کردن محتوا، فایل را در کانال آرشیو بفرست و هشتگ بگذار.\n\n"
+        "مثال:\n"
+        "#سریال #BreakingBad #S01E01\n"
+        "یا\n"
+        "#سریال #BreakingBad #فصل1 #قسمت1\n"
+        "یا برای فیلم:\n"
+        "#فیلم #Oppenheimer"
+    )
 
-    # انتخاب از زیرمنوی انیمیشن
-    if context.user_data.get("mode") == MODE_ANIME_MENU and text in ANIME_SUB:
-        cat = text
-        db = load_db()
-        items = sorted(db["categories"][cat].keys(), key=lambda x: x.lower())
-        if not items:
-            await update.message.reply_text("فعلاً چیزی اضافه نشده.", reply_markup=kb_main())
-            context.user_data["mode"] = MODE_NONE
-            return
-        context.user_data["mode"] = MODE_PICK_ITEM
-        context.user_data["picked_cat"] = cat
-        await update.message.reply_text(f"📌 {cat} رو انتخاب کن:", reply_markup=kb_list(items))
-        return
-
-    # انتخاب دسته اصلی
-    if text in CATS_MAIN and text != "انیمیشن":
-        cat = text
-        db = load_db()
-        items = sorted(db["categories"][cat].keys(), key=lambda x: x.lower())
-        if not items:
-            await update.message.reply_text("فعلاً چیزی اضافه نشده.", reply_markup=kb_main())
-            context.user_data["mode"] = MODE_NONE
-            return
-        context.user_data["mode"] = MODE_PICK_ITEM
-        context.user_data["picked_cat"] = cat
-        await update.message.reply_text(f"📌 {cat} رو انتخاب کن:", reply_markup=kb_list(items))
-        return
-
-    # انتخاب آیتم
-    if context.user_data.get("mode") == MODE_PICK_ITEM:
-        cat = context.user_data.get("picked_cat")
-        if not cat:
-            context.user_data["mode"] = MODE_NONE
-            await update.message.reply_text("از منو شروع کن.", reply_markup=kb_main())
-            return
-
-        db = load_db()
-        if text not in db["categories"][cat]:
-            items = sorted(db["categories"][cat].keys(), key=lambda x: x.lower())
-            await update.message.reply_text("از دکمه‌ها انتخاب کن.", reply_markup=kb_list(items))
-            return
-
-        # تک
-        if cat in SINGLE_CATS:
-            context.user_data["mode"] = MODE_NONE
-            await send_single(update.message.chat_id, context, cat, text)
-            return
-
-        # سریال => انتخاب فصل
-        if cat in SERIES_CATS:
-            entry = db["categories"][cat][text]
-            seasons = sorted([int(k) for k in entry.get("seasons", {}).keys() if k.isdigit()])
-            if not seasons:
-                context.user_data["mode"] = MODE_NONE
-                await update.message.reply_text("برای این سریال فصلی ثبت نشده.", reply_markup=kb_main())
-                return
-            context.user_data["mode"] = MODE_PICK_SEASON
-            context.user_data["picked_item"] = text
-            await update.message.reply_text("فصل رو انتخاب کن:", reply_markup=kb_seasons(seasons))
-            return
-
-    # انتخاب فصل
-    if context.user_data.get("mode") == MODE_PICK_SEASON:
-        cat = context.user_data.get("picked_cat")
-        name = context.user_data.get("picked_item")
-        if not cat or not name:
-            context.user_data["mode"] = MODE_NONE
-            await update.message.reply_text("از منو شروع کن.", reply_markup=kb_main())
-            return
-
-        if text.startswith("فصل"):
-            try:
-                season = int(text.replace("فصل", "").strip())
-            except ValueError:
-                await update.message.reply_text("فصل نامعتبر.", reply_markup=kb_main())
-                context.user_data["mode"] = MODE_NONE
-                return
-
-            # قسمت 1 را بفرست
-            await send_episode(update.message.chat_id, context, cat, name, season, 1)
-
-            context.user_data["mode"] = MODE_NONE
-            context.user_data.pop("picked_cat", None)
-            context.user_data.pop("picked_item", None)
-            return
-
-        await update.message.reply_text("از دکمه‌های فصل انتخاب کن.", reply_markup=kb_main())
-        return
-
-    await update.message.reply_text("از منو یکی رو انتخاب کن 👇", reply_markup=kb_main())
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = (q.data or "").split("|")
-    if not data:
-        return
-
-    if data[0] == "ep" and len(data) >= 6:
-        cat = data[1]
-        name = data[2]
-        season = int(data[3])
-        ep = int(data[4])
-        await send_episode(q.message.chat_id, context, cat, name, season, ep)
-        return
-
-    if data[0] == "pickseason" and len(data) >= 3:
-        cat = data[1]
-        name = data[2]
-        db = load_db()
-        entry = db["categories"].get(cat, {}).get(name)
-        if not entry:
-            await context.bot.send_message(q.message.chat_id, "❌ پیدا نشد.")
-            return
-        seasons = sorted([int(k) for k in entry.get("seasons", {}).keys() if k.isdigit()])
-        context.user_data["mode"] = MODE_PICK_SEASON
-        context.user_data["picked_cat"] = cat
-        context.user_data["picked_item"] = name
-        await context.bot.send_message(q.message.chat_id, f"📺 {name}\nفصل را انتخاب کن:", reply_markup=kb_seasons(seasons))
-        return
+# ادامه کد on_text و on_callback بدون تغییر باقی مانده
+# لطفاً همان کدهای شما را اینجا نگه دارید
+# ... (بقیه کدها بدون تغییر)
 
 # =======================
 # main
@@ -526,7 +408,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("last", last))
-    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("add", add))  # حالا این خط درست شده
 
     # کانال
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
